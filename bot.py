@@ -1,180 +1,127 @@
-# main.py
 import os
-import asyncio
-import json
-import time
-from typing import Optional
-from dotenv import load_dotenv
-import requests
 import discord
+import requests
+from discord.ext import commands
+from dotenv import load_dotenv
+import asyncio
 
+# Load environment variables
 load_dotenv()
 
-# --- Config from env ---
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "gemma2-3b")
-MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", "180"))
-TEMPERATURE = float(os.getenv("TEMPERATURE", "0.7"))
-OWNER_ID = int(os.getenv("OWNER_ID")) if os.getenv("OWNER_ID") else None
+GROQ_MODEL = os.getenv("GROQ_MODEL", "gemma2-3b")  # default model
+MAX_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", 180))
+TEMPERATURE = float(os.getenv("TEMPERATURE", 0.7))
+OWNER_ID = os.getenv("OWNER_ID")  # optional
 
-if not DISCORD_TOKEN or not GROQ_API_KEY:
-    raise RuntimeError("Set DISCORD_TOKEN and GROQ_API_KEY in environment variables.")
-
-# --- Discord setup ---
+# Discord intents
 intents = discord.Intents.default()
 intents.message_content = True
-client = discord.Client(intents=intents)
 
-# --- Simple per-user rate limit (tokens) ---
-# Allows bursts but prevents spamming the Groq API
-USER_BUCKET = {}  # uid -> (tokens, last_refill_ts)
-RATE_MAX_TOKENS = 3
-RATE_REFILL_SECONDS = 20  # refill interval for full bucket
+bot = commands.Bot(command_prefix="!", intents=intents)
 
-def refill_tokens(uid: int):
-    now = time.time()
-    tokens, last = USER_BUCKET.get(uid, (RATE_MAX_TOKENS, now))
-    elapsed = now - last
-    # linear refill
-    refill = (elapsed / RATE_REFILL_SECONDS) * RATE_MAX_TOKENS
-    tokens = min(RATE_MAX_TOKENS, tokens + refill)
-    USER_BUCKET[uid] = (tokens, now)
-    return tokens
+# Simple rate limiter per user
+cooldown = {}
+COOLDOWN_SECONDS = 5
 
-def consume_token(uid: int) -> bool:
-    tokens = refill_tokens(uid)
-    tokens, last = USER_BUCKET.get(uid, (RATE_MAX_TOKENS, time.time()))
-    if tokens >= 1:
-        USER_BUCKET[uid] = (tokens - 1, last)
-        return True
-    USER_BUCKET[uid] = (tokens, last)
-    return False
 
-# --- Personality / system prompt ---
-SYSTEM_PROMPT = (
-    "You are Manzar — a witty, slightly savage Discord poet inspired by Jaun Elia.\n"
-    "Style: mix Hindi/Urdu casually with English, short shayari lines, playful roasts. "
-    "Be creative and never produce hateful or illegal content. Keep replies short (1–6 sentences) unless user asks for more.\n"
-)
+def is_in_cooldown(user_id):
+    if user_id not in cooldown:
+        return False
+    return (asyncio.get_event_loop().time() - cooldown[user_id]) < COOLDOWN_SECONDS
 
-# build messages for Groq's OpenAI-compatible chat endpoint
-def build_messages(user_text: str, mode_hint: Optional[str] = None):
-    messages = []
-    messages.append({"role": "system", "content": SYSTEM_PROMPT})
-    if mode_hint:
-        # optional mode instruction
-        messages.append({"role": "system", "content": f"MODE_HINT: {mode_hint}"})
-    messages.append({"role": "user", "content": user_text})
-    return messages
 
-# --- Call Groq OpenAI-compatible chat completion endpoint ---
-# Docs: POST https://api.groq.com/openai/v1/chat/completions
-# Authorization: Bearer <GROQ_API_KEY>
-GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions"
+def update_cooldown(user_id):
+    cooldown[user_id] = asyncio.get_event_loop().time()
 
-def call_groq_chat(messages, model=GROQ_MODEL, max_output_tokens=MAX_OUTPUT_TOKENS, temperature=TEMPERATURE, timeout=60):
+
+# --------------------------
+# GROQ CHAT FUNCTION
+# --------------------------
+def groq_generate(message_content):
+    url = "https://api.groq.com/openai/v1/chat/completions"
+
+    prompt = f"""
+You are MANZAR, a savage but poetic Urdu/Hindi chatbot. 
+Your style = roasted + witty + shayari + Jaun Elia tone.
+Always respond like a cool dost, with 1–2 lines of shayari sometimes.
+
+User said: {message_content}
+Respond naturally.
+"""
+
     payload = {
-        "model": model,
-        "messages": messages,
-        "max_output_tokens": max_output_tokens,
-        "temperature": temperature,
+        "model": GROQ_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": MAX_TOKENS,
+        "temperature": TEMPERATURE
     }
+
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
-        "Content-Type": "application/json",
+        "Content-Type": "application/json"
     }
-    resp = requests.post(GROQ_CHAT_URL, json=payload, headers=headers, timeout=timeout)
-    resp.raise_for_status()
-    data = resp.json()
-    # try common response paths
-    if isinstance(data, dict):
-        # openai-compat: choices[0].message.content
-        if "choices" in data and len(data["choices"]) > 0:
-            choice = data["choices"][0]
-            msg = choice.get("message", {}).get("content")
-            if msg:
-                return msg
-        # groq: may include 'text' or 'response' top-level
-        if "response" in data:
-            return data["response"]
-        if "text" in data:
-            return data["text"]
-    # fallback: return string form
-    return json.dumps(data)[:1900]
 
-# --- Bot behavior ---
-@client.event
+    r = requests.post(url, json=payload, headers=headers)
+    r.raise_for_status()
+    return r.json()["choices"][0]["message"]["content"]
+
+
+# --------------------------
+# DISCORD EVENTS
+# --------------------------
+@bot.event
 async def on_ready():
-    print(f"Logged in as {client.user} — groq model: {GROQ_MODEL}")
+    print(f"Logged in as {bot.user} — using model: {GROQ_MODEL}")
+    await bot.change_presence(activity=discord.Game("Manzar is alive 😎🔥"))
 
-@client.event
-async def on_message(message: discord.Message):
-    if message.author == client.user:
+
+@bot.event
+async def on_message(message):
+    if message.author == bot.user:
         return
 
-    content = message.content.strip()
-    lower = content.lower()
-
-    # help
-    if lower.startswith("!help"):
-        await message.reply("Commands: `!manzar <text>` or mention me. Extras: `!shayari`, `!roast`, `!mode <default|jaunelia|friendly|roast` (owner only).")
+    # Rate limit
+    if is_in_cooldown(message.author.id):
+        await message.channel.send("Bhai thoda ruk ja… CPU bhi insaan hai 😭")
         return
 
-    # owner only: change system style quickly (optional)
-    if lower.startswith("!mode ") and OWNER_ID and message.author.id == OWNER_ID:
-        # store mode hint in a simple local attribution (or you can implement persistence)
-        mode = lower.split(" ",1)[1].strip()
-        await message.reply(f"Mode changed on-the-fly to: {mode} (applies to next messages).")
-        # we'll just pass mode as mode_hint when building messages below, no persistence
-        return
+    update_cooldown(message.author.id)
 
-    if lower.startswith("!shayari"):
-        user_query = "Write a short 2-line Urdu/Hindi shayari inspired by Jaun Elia but original."
-    elif lower.startswith("!roast"):
-        user_query = "Write a short playful roast (1-2 lines). Keep it witty, not hateful."
-    elif client.user.mentioned_in(message) or lower.startswith("!manzar"):
-        # extract text
-        user_query = content.replace(f"<@{client.user.id}>","").replace("!manzar","").strip()
-        if not user_query:
-            user_query = "hello"
+    # Trigger on bot mention
+    if bot.user.mention in message.content or message.content.lower().startswith("!manzar"):
+        user_prompt = message.content.replace(f"<@{bot.user.id}>", "").strip()
+        if user_prompt == "":
+            user_prompt = "Bol bhai?"
+
+        try:
+            reply = await asyncio.to_thread(groq_generate, user_prompt)
+            await message.channel.send(reply)
+        except Exception as e:
+            await message.channel.send("Abe kuch gadbad ho gayi… fir try kar 😂")
+            print("ERROR:", e)
+
+    await bot.process_commands(message)
+
+
+# --------------------------
+# BASIC COMMANDS
+# --------------------------
+@bot.command()
+async def ping(ctx):
+    await ctx.send("Pong bhai 😎")
+
+
+@bot.command()
+async def owner(ctx):
+    if OWNER_ID:
+        await ctx.send(f"Mera malik: <@{OWNER_ID}>")
     else:
-        return
+        await ctx.send("Owner not set.")
 
-    # Rate-limit per-user
-    if not consume_token(message.author.id):
-        await message.reply("Slow down bhai — too many requests. Try again in a few seconds.")
-        return
 
-    # Show typing indicator
-    await message.channel.trigger_typing()
-
-    # Build messages (we could support modes by reading message or a small memory; keeping simple)
-    mode_hint = None
-    if lower.startswith("!shayari"):
-        mode_hint = "jaunelia"
-    elif lower.startswith("!roast"):
-        mode_hint = "roast"
-    messages = build_messages(user_query, mode_hint=mode_hint)
-
-    # Run blocking network call in executor
-    loop = asyncio.get_event_loop()
-    try:
-        ai_reply = await loop.run_in_executor(None, call_groq_chat, messages)
-    except Exception as e:
-        print("Groq API error:", e)
-        await message.reply("Mera brain abhi busy hai — try again in a bit.")
-        return
-
-    if not ai_reply:
-        await message.reply("Kuch garbar ho gayi, try again.")
-        return
-
-    # Truncate if too long
-    if len(ai_reply) > 1900:
-        ai_reply = ai_reply[:1900] + "\n\n...(truncated)"
-
-    await message.reply(ai_reply)
-
-if __name__ == "__main__":
-    client.run(DISCORD_TOKEN)
+# --------------------------
+# RUN BOT
+# --------------------------
+bot.run(DISCORD_TOKEN)
